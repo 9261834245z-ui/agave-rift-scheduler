@@ -1,29 +1,96 @@
+<div align="center">
+
 # agave-rift-scheduler
 
 [![CI](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/ci.yml)
 [![Fuzz](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/fuzz-daily.yml/badge.svg)](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/fuzz-daily.yml)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Research implementation of a conflict-aware transaction scheduler for Agave SVM.  
-Experimentally verified through continuous fuzzing and regression testing.
+**Conflict-aware transaction scheduler with bounded retry semantics and explicit starvation observability.**
+
+*A research implementation by [RFT-SIRM](https://github.com/RFT-SIRM/UltraCore-RFT).*
+
+</div>
+
+---
+
+## What This Is
+
+This repository contains a **reference implementation** of a transaction scheduler that explores bounded retry semantics and deterministic starvation observability. It was built to:
+
+1. Model scheduling behavior under sustained account-level write contention.
+2. Verify that bounded retry semantics can be enforced without invariant violations.
+3. Provide a concrete proposal for discussion with the Agave core team.
+
+**Upstream engagement:**
+- 📋 **[RFC] Bounded retry semantics and starvation observability for GreedyScheduler** — [anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274)
+- 🔒 **CPI permission leakage in SVM runtime** — [anza-xyz/svm#25](https://github.com/anza-xyz/svm/issues/25) (related security research from the same lab)
+
+**This is not a production patch for Agave.** It is a research artifact. See [Disclaimer](#disclaimer) below.
+
+---
+
+## Context: Why This Research Exists
+
+The default `GreedyScheduler` in Agave (`core/src/banking_stage/transaction_scheduler/greedy_scheduler.rs`) defers conflicting transactions by re-inserting them into the priority queue. This design is correct for the common case, but it does not expose:
+
+- a per-transaction retry counter,
+- a configurable upper bound on deferral count,
+- a `dropped_transactions` metric when a transaction is discarded after excessive deferral.
+
+Under sustained write contention on a hot account, a lower-priority transaction may be deferred across an unbounded number of scheduling passes. The transaction is **not lost** — it remains in the queue — but its scheduling latency is **unbounded and unobservable**.
+
+This repository implements an alternative scheduling semantics with explicit bounds, then verifies those bounds through continuous fuzzing.
+
+> **For the full technical discussion, see the RFC:** [anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274)
 
 ---
 
 ## Architecture
+
 ### Hotspot Heat Map
 
 Every writable account is tracked with a heat score:
-- Heat increases by `initial_heat` on each scheduled write
-- Heat decays by right-shifting `hotspot_decay_shift` bits per generation of age
-- Accounts exceeding `max_generation_age` generations are evicted
+- Heat increases by `initial_heat` on each scheduled write.
+- Heat decays by right-shifting `hotspot_decay_shift` bits per generation of age.
+- Accounts exceeding `max_generation_age` generations are evicted.
 
 ### Generation Aging
 
-Each call to `schedule()` advances `current_generation` by 1.  
-Deferred transactions carry a `ready_generation` timestamp.  
+Each call to `schedule()` advances `current_generation` by 1.
+Deferred transactions carry a `ready_generation` timestamp.
 A transaction is only retried when `ready_generation ≤ current_generation`.
 
 ### Retry Cycle
+
+```
+Transaction arrives
+        |
+        v
+  Priority queue
+        |
+        v
+  Pop highest priority
+        |
+        v
+  try_lock_accounts()
+        |
+    +---|---+
+    |       |
+  Success  Conflict
+    |       |
+    v       v
+ Schedule  Increment retry counter
+            |
+            +--- retries > max_retry_count? ---+
+            |                                     |
+           No                                   Yes
+            |                                     |
+            v                                     v
+    Push to deferred queue              Drop with metric increment
+    (ready_generation = next gen)       (dropped_transactions += 1)
+```
+
 ---
 
 ## Design Goals
@@ -34,65 +101,62 @@ A transaction is only retried when `ready_generation ≤ current_generation`.
 
 **Conflict-aware execution** — writable account contention is tracked per-account via a heat score, not per-transaction-pair. This scales to large account sets without combinatorial overhead.
 
-**Starvation prevention** — `max_retry_count` enforces a hard upper bound on retries. A transaction that cannot be scheduled within that bound is dropped with a metric increment, never silently lost.
+**Starvation observability** — `max_retry_count` enforces a hard upper bound on retries. A transaction that cannot be scheduled within that bound is dropped with an explicit metric increment (`dropped_transactions`), never silently deferred.
 
 **Predictable memory behaviour** — the deferred queue is bounded by `max_retry_count`. The hotspot map is bounded by `hotspot_capacity`. No unbounded growth paths exist.
 
 ---
 
-## Why This Differs from the Current Agave Scheduler
+## Relationship to Agave GreedyScheduler
 
-This is a candidate design, not a replacement claim. Engineering differences:
+This implementation is **not a drop-in replacement** for Agave's `GreedyScheduler`. It is a research model that explores alternative semantics.
 
-| Property | Current Agave | This implementation |
-|----------|--------------|---------------------|
-| Deferred queue drain | Not present in research baseline | Explicit per-pass drain |
-| Zero-cost conflict detection | Gated on `tx.cost > 0` | Unconditional |
-| Heat-based hotspot tracking | Thread-level locking | Per-account heat score |
-| Retry bound | Unbounded in baseline | Hard cap via `max_retry_count` |
-| Fuzz verification | Not present | libFuzzer, 5h 55m daily |
+| Property | Agave GreedyScheduler (current) | This implementation (research) |
+|:---------|:----------------------------------|:-------------------------------|
+| Deferred queue drain | Re-inserts all unschedulables after each pass | Explicit per-pass drain with retry counter |
+| Conflict detection | Unconditional (current master) | Unconditional |
+| Retry bound | None — unbounded deferral | Hard cap via `max_retry_count` |
+| Drop metric | None in `SchedulingSummary` | `dropped_transactions` counter |
+| Heat-based throttling | Thread-level locking | Per-account heat score with decay |
+| Fuzz verification | Not present in this component | libFuzzer, 5h 55m daily |
 
-These differences are experimentally verified, not benchmarked against production Agave.
+> **Note on conflict detection:** We initially investigated whether cost filtering could interact with conflict detection in earlier Agave versions. Current master (`anza-xyz/agave`, August 2026) calls `try_lock_accounts` before any cost filtering. Conflict detection is unconditional in both implementations.
 
 ---
 
 ## Invariants
 
+All invariants are asserted after every scheduling pass during fuzzing.
+
 ### I1: Accounting invariant
 
-**Statement:** `scheduled + deferred + dropped ≤ scanned` per pass
+**Statement:** `scheduled + deferred + dropped ≤ scanned` per pass.
 
 **Reason:** Every transaction that enters `schedule()` must be accounted for. Silent loss is unacceptable.
 
 **Failure mode:** A transaction disappears from all counters. Budget or queue logic has a branch that returns without incrementing any counter.
 
-**Verified by:** `fuzz_target` INVARIANT 1 assertion, unit test `defers_conflicting_hot_accounts`
-
----
+**Verified by:** `fuzz_target` INVARIANT 1 assertion, unit test `defers_conflicting_hot_accounts`.
 
 ### I2: Generation monotonicity
 
-**Statement:** `summary.generation > 0` after every pass
+**Statement:** `summary.generation > 0` after every pass.
 
 **Reason:** Generation counter must be strictly positive. A zero generation would make all deferred transactions with `ready_generation = 1` permanently unretriable.
 
 **Failure mode:** Wrapping underflow on generation counter.
 
-**Verified by:** `fuzz_target` INVARIANT 2 assertion
-
----
+**Verified by:** `fuzz_target` INVARIANT 2 assertion.
 
 ### I3: Pass counter monotonicity
 
-**Statement:** `scheduler_passes ≥ 1` after every call to `schedule()`
+**Statement:** `scheduler_passes ≥ 1` after every call to `schedule()`.
 
 **Reason:** Metrics must accumulate correctly. A pass counter that does not increment would corrupt all derived metrics.
 
 **Failure mode:** Early return before `metrics.scheduler_passes += 1`.
 
-**Verified by:** `fuzz_target` INVARIANT 3 assertion
-
----
+**Verified by:** `fuzz_target` INVARIANT 3 assertion.
 
 ### I4: Deferred queue drain
 
@@ -102,42 +166,44 @@ These differences are experimentally verified, not benchmarked against productio
 
 **Failure mode:** A transaction's `ready_generation` is set beyond any reachable generation value, or `max_retry_count` check is missing.
 
-**Verified by:** `fuzz_target` INVARIANT 4 assertion (8192 drain passes), unit test `deferred_transaction_is_dropped_after_max_retries`
+**Verified by:** `fuzz_target` INVARIANT 4 assertion (8192 drain passes), unit test `deferred_transaction_is_dropped_after_max_retries`.
 
 ---
 
-## Bugs Found and Fixed
+## Development History
 
-### Bug 1: Dead deferred queue
+During the construction of this reference implementation, we encountered and resolved several design errors in our own code. These are documented below as **lessons from building a scheduler from scratch**, not as claims about Agave.
 
-**Description:** Deferred transactions were pushed into `self.deferred` but nothing ever read them back. The queue was write-only.
+### Lesson 1: Dead deferred queue
 
-**Impact:** Every deferred transaction was silently lost. The scheduler appeared to work but dropped conflicting transactions permanently.
+**Description:** Early versions pushed deferred transactions into `self.deferred` but never read them back. The queue was write-only.
+
+**Impact:** Every deferred transaction was silently lost in our own implementation.
 
 **Fix:** Every `schedule()` pass now partitions `self.deferred` into ready and still-waiting entries before processing new transactions.
 
 **Regression test:** `deferred_transactions_are_retried_and_eventually_scheduled`
 
----
+### Lesson 2: Cost-filtering interaction
 
-### Bug 2: Zero-cost conflict bypass
+**Description:** Early versions gated conflict deferral on `tx.cost > 0`. This was a design error in our model.
 
-**Description:** The conflict-defer branch was guarded by `tx.cost > 0`. Zero-cost transactions touching hot accounts bypassed conflict detection entirely.
-
-**Impact:** Zero-cost transactions could schedule immediately on maximally contested accounts, violating the conflict threshold invariant.
+**Impact:** Zero-cost transactions in our simulation could bypass conflict detection.
 
 **Fix:** Conflict check is now unconditional. Cost is only relevant for budget enforcement, not conflict detection.
 
 **Regression test:** `zero_cost_tx_does_not_bypass_conflict_detection`
 
+> **Important:** These lessons informed our understanding of scheduler design. They do not constitute claims about bugs in Agave's current implementation. See [anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274) for our verified observations about Agave's scheduler.
+
 ---
 
 ## Testing Matrix
 
-| Test | Purpose | Bug prevented |
-|------|---------|---------------|
-| `deferred_transactions_are_retried_and_eventually_scheduled` | Dead deferred queue regression | Bug 1 |
-| `zero_cost_tx_does_not_bypass_conflict_detection` | Zero-cost bypass regression | Bug 2 |
+| Test | Purpose | Invariant / Bug prevented |
+|------|---------|--------------------------|
+| `deferred_transactions_are_retried_and_eventually_scheduled` | Dead deferred queue regression | Lesson 1 |
+| `zero_cost_tx_does_not_bypass_conflict_detection` | Cost-filtering regression | Lesson 2 |
 | `deferred_transaction_is_dropped_after_max_retries` | Retry cap enforcement | I4 violation |
 | `hotspot_decay_reduces_heat_gradually` | Heat decay correctness | Starvation |
 | `budget_exhaustion_defers_without_conflict` | Budget vs conflict separation | Misclassification |
@@ -148,7 +214,7 @@ These differences are experimentally verified, not benchmarked against productio
 | `multiple_independent_accounts_schedule_separately` | No false conflicts | Throughput loss |
 | `budget_backoff_retries_next_generation` | Budget retry path | Silent drop |
 | `max_retry_count_drops_transaction` | Starvation prevention | I4 violation |
-| `zero_cost_tx_in_high_conflict_defers` | Zero-cost + conflict | Bug 2 variant |
+| `zero_cost_tx_in_high_conflict_defers` | Zero-cost + conflict | Lesson 2 variant |
 | `defers_conflicting_hot_accounts` | Basic conflict detection | I1 violation |
 | `cleanup_removes_stale_hotspots` | Memory bounds | Unbounded growth |
 | Fuzz target (5h 55m) | All 4 invariants, random configs | All of the above |
@@ -164,10 +230,22 @@ The fuzz target generates:
 - Random sequences of scheduling passes
 - Random transactions with random account accesses
 
-After every pass, all 4 invariants are asserted.  
+After every pass, all 4 invariants are asserted.
 After all passes complete, 8192 drain passes verify I4.
 
 ### Configuration bounds in fuzzer
+
+```rust
+// Ensures termination and bounded state space
+conflict_threshold: 1..=10,
+max_generation_age: 8..=32,
+hotspot_decay_shift: 0..=4,
+max_retry_count: 3..=20,
+hotspot_capacity: 256..=8192,
+initial_heat: 1..=10,
+max_account_heat: 64..=255,
+```
+
 ### Why long-duration fuzzing increases confidence but does not prove correctness
 
 Fuzzing explores the input space stochastically. A 5h 55m run at ~4,300 exec/s on GitHub Actions produces approximately 91 million executions. This increases confidence that no invariant violation exists for inputs of this size and shape. It does not constitute a formal proof. Formal verification would require model checking or theorem proving, which is outside the scope of this research.
@@ -239,30 +317,58 @@ SchedulerConfig {
 
 ## Roadmap
 
-**Phase 1 — Standalone scheduler (current)**  
-Conflict detection, deferred queue drain, retry cap, heat decay.  
-All invariants verified. Bugs found and regression-tested.
+**Phase 1 — Standalone scheduler (current)**
+Conflict detection, deferred queue drain, retry cap, heat decay.
+All invariants verified. Lessons learned and regression-tested.
 
-**Phase 2 — Integration into Agave**  
-Integrate with `anza-xyz/agave` transaction-context crate.  
+**Phase 2 — Integration into Agave**
+Integrate with `anza-xyz/agave` transaction-context crate.
 Replace mock types with real `TransactionContext` and `AccountId`.
 
-**Phase 3 — Real validator benchmarks**  
-Measure against existing Agave scheduler on mainnet-representative workloads.  
+**Phase 3 — Real validator benchmarks**
+Measure against existing Agave scheduler on mainnet-representative workloads.
 Produce before/after numbers with Criterion.
 
-**Phase 4 — RFC / PR**  
-Open a focused Draft PR against `anza-xyz/agave` with:  
+**Phase 4 — RFC / PR**
+Open a focused Draft PR against `anza-xyz/agave` with:
 fuzz corpus, benchmark results, and invariant documentation as evidence.
+
+> **Update:** Phase 4 RFC is already published: [anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274)
 
 ---
 
 ## Repository Layout
+
+```
+.
+├── Cargo.toml              # Workspace manifest
+├── src/
+│   ├── lib.rs              # Core scheduler engine
+│   ├── config.rs           # SchedulerConfig
+│   ├── heat_map.rs         # Hotspot tracking
+│   ├── deferred_queue.rs   # Retry and generation logic
+│   └── metrics.rs          # SchedulingSummary
+├── tests/
+│   └── integration_tests.rs # 15 regression tests
+├── fuzz/
+│   └── fuzz_targets/
+│       └── scheduler_fuzz.rs # libFuzzer harness
+├── .github/
+│   └── workflows/
+│       ├── ci.yml          # Unit test + clippy
+│       └── fuzz-daily.yml  # 5h 55m fuzz run
+└── README.md               # This file
+```
+
 ---
 
 ## Quick Start
 
 ```bash
+# Clone
+git clone https://github.com/RFT-SIRM/agave-rift-scheduler.git
+cd agave-rift-scheduler
+
 # Build
 cargo build --release
 
@@ -278,9 +384,31 @@ cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=21300
 
 ---
 
+## Ecosystem
+
+This repository is part of the [RFT-SIRM](https://github.com/RFT-SIRM/UltraCore-RFT) research ecosystem:
+
+| Repository | Role | Status |
+|:-----------|:-----|:-------|
+| [UltraCore-RFT](https://github.com/RFT-SIRM/UltraCore-RFT) | Central research hub and documentation | Active |
+| [Rift-L1-Blockchain](https://github.com/RFT-SIRM/Rift-L1-Blockchain) | Standalone validator core with SIRM invariants | Core complete |
+| [Rift-Network](https://github.com/RFT-SIRM/Rift-Network) | Solana on-chain protocol (Anchor) | RC v1.0 |
+| [agave-abiv2-memory-contexts](https://github.com/RFT-SIRM/agave-abiv2-memory-contexts) | SVM memory isolation research | Active |
+| **agave-rift-scheduler** | Transaction scheduling research | **RFC published** |
+
+---
+
+## Disclaimer
+
+- **Not a production patch.** This is a research implementation. It is not intended for deployment on mainnet validators without extensive additional testing.
+- **Not a bug report on Agave.** The RFC ([anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274)) documents an observed scheduling limitation and proposes a minimal observability improvement. It does not claim that GreedyScheduler is broken or unsafe.
+- **Not a consensus issue.** This research concerns transaction scheduling latency and observability, not consensus safety or transaction integrity.
+- **Lessons learned are from our own code.** The "Development History" section documents errors we made while building this reference implementation. They are not claims about bugs in Agave.
+
+---
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE)
 
-This is a research repository. It is not a production patch.  
 © 2026 Eugeny (RFT-SIRM)
