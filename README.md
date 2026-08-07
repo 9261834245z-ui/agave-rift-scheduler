@@ -49,8 +49,7 @@ This repository contains a reference implementation of a transaction scheduler t
 **Upstream engagement:**
 
 - 📋 [RFC] Bounded retry semantics and starvation observability for GreedyScheduler — [anza-xyz/agave#14274](https://github.com/anza-xyz/agave/issues/14274)
-- 🔒 CPI permission leakage in SVM runtime — [anza-xyz/svm#25](https://github.com/anza-xyz/svm/issues/25) (related security research from the same lab)
-
+🔒 CPI permission model research — [anza-xyz/svm#25](https://github.com/anza-xyz/svm/issues/25) (closed, PoC-only finding — upstream uses `abi_v2_prepare_for_instruction` architecture)
 > **This is not a production patch for Agave.** It is a research artifact. See [Disclaimer](#-disclaimer) below.
 
 * * *
